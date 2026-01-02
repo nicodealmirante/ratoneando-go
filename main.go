@@ -1,115 +1,130 @@
-import pg from "pg";
-import { Jumbo } from "./scrapers/jumbo.js";
+package main
 
-const { Pool } = pg;
+import (
+	"database/sql"
+	"log"
+	"os"
+	"strings"
+	"unicode"
 
-const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  ssl: process.env.DATABASE_URL?.includes("railway")
-    ? { rejectUnauthorized: false }
-    : false,
-});
+	_ "github.com/lib/pq"
+	"golang.org/x/text/unicode/norm"
 
-/* ============== NORMALIZADOR ============== */
-function normalize(str = "") {
-  return str
-    .toLowerCase()
-    .normalize("NFD")
-    .replace(/[\u0300-\u036f]/g, "") // quita acentos
-    .replace(/ñ/g, "n")
-    .replace(/\s+/g, "+")
-    .replace(/\++/g, "+")
-    .replace(/^\+|\+$/g, "");
+	"ratoneando/scrapers"
+)
+
+/* ================= NORMALIZADOR ================= */
+
+func normalize(s string) string {
+	s = strings.ToLower(s)
+	t := norm.NFD.String(s)
+
+	var b strings.Builder
+	for _, r := range t {
+		if unicode.Is(unicode.Mn, r) {
+			continue
+		}
+		if r == 'ñ' {
+			r = 'n'
+		}
+		if unicode.IsSpace(r) {
+			r = '+'
+		}
+		b.WriteRune(r)
+	}
+
+	out := strings.Trim(b.String(), "+")
+	for strings.Contains(out, "++") {
+		out = strings.ReplaceAll(out, "++", "+")
+	}
+	return out
 }
 
-/* ============== MAIN ============== */
-async function run() {
-  if (!process.env.DATABASE_URL) {
-    console.error("DATABASE_URL no definido");
-    process.exit(1);
-  }
+/* ================= MAIN ================= */
 
-  const products = await Jumbo("");
+func main() {
+	dsn := os.Getenv("DATABASE_URL")
+	if dsn == "" {
+		log.Fatal("❌ DATABASE_URL no definido")
+	}
 
-  let updated = 0;
-  let skipped = 0;
-  let comparisons = 0;
+	db, err := sql.Open("postgres", dsn)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer db.Close()
 
-  const selectByName = `
-    SELECT id, name, image, price
-    FROM products
-    WHERE source = 'jumbo'
-      AND normalized_name LIKE $1
-  `;
+	products, err := scrapers.Jumbo("")
+	if err != nil {
+		log.Fatal(err)
+	}
 
-  const updatePrice = `
-    UPDATE products
-    SET price = $1,
-        list_price = $2,
-        updated_at = NOW()
-    WHERE id = $3
-  `;
+	selectByName := `
+		SELECT id, name, image, price
+		FROM products
+		WHERE source = 'jumbo'
+		  AND normalized_name LIKE $1
+	`
 
-  const client = await pool.connect();
+	updatePrice := `
+		UPDATE products
+		SET price = $1,
+		    list_price = $2,
+		    updated_at = NOW()
+		WHERE id = $3
+	`
 
-  try {
-    for (const p of products) {
-      const normalized = normalize(p.Name);
-      let parts = normalized.split("+");
-      let matched = false;
+	for _, p := range products {
+		normalized := normalize(p.Name)
+		words := strings.Split(normalized, "+")
+		found := false
 
-      while (parts.length > 0 && !matched) {
-        const search = parts.join("+") + "%";
+		for len(words) > 0 && !found {
+			search := strings.Join(words, "+") + "%"
 
-        const res = await client.query(selectByName, [search]);
+			rows, err := db.Query(selectByName, search)
+			if err != nil {
+				log.Println("Query error:", err)
+				break
+			}
 
-        for (const row of res.rows) {
-          comparisons++;
+			for rows.Next() {
+				var (
+					id       string
+					dbName   string
+					dbImage  string
+					oldPrice float64
+				)
 
-          // 🔑 VALIDACIÓN FINAL: IMAGE EXACTA
-          if (row.image === p.Image) {
-            if (Number(row.price) !== Number(p.Price)) {
-              await client.query(updatePrice, [
-                p.Price,
-                p.ListPrice,
-                row.id,
-              ]);
+				if err := rows.Scan(&id, &dbName, &dbImage, &oldPrice); err != nil {
+					continue
+				}
 
-              console.log(
-                `✅ UPDATE | ${row.name} | ${row.price} → ${p.Price}`
-              );
-            } else {
-              console.log(`ℹ️ SIN CAMBIO | ${row.name}`);
-            }
+				// 🔑 VALIDACIÓN FINAL: IMAGE EXACTA
+				if dbImage == p.Image {
+					if oldPrice != p.Price {
+						_, err := db.Exec(updatePrice, p.Price, p.ListPrice, id)
+						if err == nil {
+							log.Printf("✅ UPDATE [%s] %.2f → %.2f\n", dbName, oldPrice, p.Price)
+						}
+					} else {
+						log.Printf("ℹ️ SIN CAMBIO [%s]\n", dbName)
+					}
+					found = true
+					break
+				}
+			}
 
-            updated++;
-            matched = true;
-            break;
-          }
-        }
+			rows.Close()
 
-        // ❌ no hubo match → quitar última palabra
-        parts.pop();
-      }
+			// ❌ no encontró → quitar última palabra
+			words = words[:len(words)-1]
+		}
 
-      if (!matched) {
-        skipped++;
-        console.log(`❌ NO MATCH | ${p.Name}`);
-      }
-    }
-  } finally {
-    client.release();
-  }
+		if !found {
+			log.Printf("❌ NO MATCH [%s]\n", p.Name)
+		}
+	}
 
-  console.log("======== RESUMEN ========");
-  console.log("Actualizados:", updated);
-  console.log("Sin match:", skipped);
-  console.log("Comparaciones image:", comparisons);
-
-  await pool.end();
+	log.Println("🎯 Proceso finalizado")
 }
-
-run().catch((e) => {
-  console.error(e);
-  process.exit(1);
-});
